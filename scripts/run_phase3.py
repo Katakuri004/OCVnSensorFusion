@@ -5,18 +5,23 @@ from pathlib import Path
 import sys
 
 import cv2
+import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from trekion.segmentation import (
-    create_hand_landmarker,
-    draw_hands_bgr,
-    ensure_hand_landmarker_model,
-    yolo_predict_device,
+    Phase3Config,
+    fuse_scene_and_hands,
+    infer_detections,
+    infer_hands,
+    render_detections,
+    segmentation_pipeline,
 )
+from trekion.parsers import parse_imu, parse_vts
+from trekion.sync import build_frame_sync
 
-DEFAULT_YOLO = "yolov8n-seg.pt"
+DEFAULT_YOLO = "yolov8s-seg.pt"
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,25 +36,44 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "cpu", "cuda"),
     )
     p.add_argument("--conf", type=float, default=0.25)
-    p.add_argument("--imgsz", type=int, default=640)
+    p.add_argument("--imgsz", type=int, default=960)
     p.add_argument("--hands", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--depth", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--imu", type=Path, default=None)
+    p.add_argument("--vts", type=Path, default=None)
+    p.add_argument("--motion-threshold", type=float, default=4.0)
     p.add_argument("--max-frames", type=int, default=-1)
     return p.parse_args()
+
+
+def _load_imu_sync(imu_path: Path | None, vts_path: Path | None) -> pd.DataFrame | None:
+    if imu_path is None or vts_path is None:
+        return None
+    imu_df = parse_imu(imu_path).dataframe
+    vts_df = parse_vts(vts_path)
+    synced = build_frame_sync(vts_df, imu_df)
+    idx = synced["imu_idx"].to_numpy(dtype=int)
+    synced["gx"] = imu_df.iloc[idx]["gx"].to_numpy()
+    synced["gy"] = imu_df.iloc[idx]["gy"].to_numpy()
+    synced["gz"] = imu_df.iloc[idx]["gz"].to_numpy()
+    return synced
 
 
 def main() -> None:
     args = parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
-
-    from ultralytics import YOLO
-
-    device = yolo_predict_device(args.device)
-    model = YOLO(args.model)
-
-    landmarker = None
-    if args.hands:
-        model_path = ensure_hand_landmarker_model(ROOT / "models")
-        landmarker = create_hand_landmarker(model_path)
+    config = Phase3Config(
+        model_id=args.model,
+        device=args.device,
+        conf=args.conf,
+        imgsz=args.imgsz,
+        enable_hands=args.hands,
+        enable_depth=args.depth,
+        motion_gyro_threshold=args.motion_threshold,
+        hand_model_cache_dir=ROOT / "models",
+    )
+    pipeline = segmentation_pipeline(config)
+    frame_sync = _load_imu_sync(args.imu, args.vts)
 
     cap = cv2.VideoCapture(str(args.video))
     if not cap.isOpened():
@@ -76,18 +100,28 @@ def main() -> None:
                 break
             if args.max_frames > 0 and frame_idx >= args.max_frames:
                 break
+            timestamp_ms = int(round(frame_idx * 1000.0 / fps))
 
-            results = model.predict(
-                source=frame,
-                conf=args.conf,
-                imgsz=args.imgsz,
-                device=device,
-                verbose=False,
+            detections, infer_ms, stage_counts = infer_detections(pipeline, frame)
+            hands = infer_hands(pipeline, frame, timestamp_ms)
+
+            imu_row = None
+            if frame_sync is not None and frame_idx < len(frame_sync):
+                row = frame_sync.iloc[frame_idx]
+                imu_row = {"gx": float(row.get("gx", 0.0)), "gy": float(row.get("gy", 0.0)), "gz": float(row.get("gz", 0.0))}
+
+            fused = fuse_scene_and_hands(
+                pipeline=pipeline,
+                detections=detections,
+                hands=hands,
+                frame_bgr=frame,
+                frame_index=frame_idx,
+                timestamp_ms=timestamp_ms,
+                imu_row=imu_row,
+                stage_counts=stage_counts,
+                inference_ms=infer_ms,
             )
-            annotated = results[0].plot(line_width=2, font_size=1.0)
-            if landmarker is not None:
-                timestamp_ms = int(round(frame_idx * 1000.0 / fps))
-                annotated = draw_hands_bgr(annotated, landmarker, timestamp_ms)
+            annotated = render_detections(frame, fused)
 
             writer.write(annotated)
             frame_idx += 1
@@ -96,8 +130,8 @@ def main() -> None:
     finally:
         cap.release()
         writer.release()
-        if landmarker is not None:
-            landmarker.close()
+        if pipeline.hand_landmarker is not None:
+            pipeline.hand_landmarker.close()
 
     print(f"saved output -> {args.output}")
 
