@@ -20,6 +20,7 @@ def compute_timing_diagnostics(timestamps: np.ndarray) -> dict[str, float]:
             "count": float(len(timestamps)),
             "dt_mean_ms": 0.0,
             "dt_std_ms": 0.0,
+            "dt_min_ms": 0.0,
             "dt_p95_ms": 0.0,
             "dt_max_ms": 0.0,
             "non_increasing_count": 0.0,
@@ -32,6 +33,7 @@ def compute_timing_diagnostics(timestamps: np.ndarray) -> dict[str, float]:
             "count": float(len(timestamps)),
             "dt_mean_ms": 0.0,
             "dt_std_ms": 0.0,
+            "dt_min_ms": 0.0,
             "dt_p95_ms": 0.0,
             "dt_max_ms": 0.0,
             "non_increasing_count": float(np.sum(diffs <= 0)),
@@ -41,6 +43,7 @@ def compute_timing_diagnostics(timestamps: np.ndarray) -> dict[str, float]:
         "count": float(len(timestamps)),
         "dt_mean_ms": float(np.mean(positive) * 1000.0),
         "dt_std_ms": float(np.std(positive) * 1000.0),
+        "dt_min_ms": float(np.min(positive) * 1000.0),
         "dt_p95_ms": float(np.percentile(positive, 95) * 1000.0),
         "dt_max_ms": float(np.max(positive) * 1000.0),
         "non_increasing_count": float(np.sum(diffs <= 0)),
@@ -79,6 +82,8 @@ def build_frame_sync(vts: pd.DataFrame, imu: pd.DataFrame) -> pd.DataFrame:
 def get_imu_window(imu: pd.DataFrame, center_ts: float, half_window: float) -> pd.DataFrame:
     start = center_ts - half_window
     end = center_ts + half_window
-    mask = (imu["timestamp"] >= start) & (imu["timestamp"] <= end)
-    return imu.loc[mask]
+    ts = imu["timestamp"].to_numpy(dtype=np.float64)
+    left = int(np.searchsorted(ts, start, side="left"))
+    right = int(np.searchsorted(ts, end, side="right"))
+    return imu.iloc[left:right]
 

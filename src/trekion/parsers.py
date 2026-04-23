@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 import struct
 
@@ -9,6 +10,12 @@ import pandas as pd
 
 IMU_MAGIC = b"TRIMU001"
 VTS_MAGIC = b"TRIVTS01"
+IMU_DATA_OFFSET_AFTER_MAGIC = 216
+VTS_DATA_OFFSET_AFTER_MAGIC = 24
+IMU_RECORD_SIZE_BYTES = 80
+VTS_RECORD_SIZE_BYTES = 24
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -30,8 +37,21 @@ def parse_imu(path: str | Path) -> ImuParseResult:
         raise ValueError(f"Unexpected IMU magic: {magic!r}")
 
     payload = raw[8:]
-    record_size = 80
-    header_offset, offset_confidence = _detect_imu_data_start(payload, record_size=record_size)
+    # Reverse-engineered layout: <Q timestamp_ns><10f sensor channels> plus 32 bytes
+    # of reserved/padding bytes per record (8 + 40 + 32 = 80 bytes total).
+    record_size = IMU_RECORD_SIZE_BYTES
+    header_offset = IMU_DATA_OFFSET_AFTER_MAGIC
+    offset_confidence = 1.0
+    remaining = len(payload) - header_offset
+    if remaining <= 0 or remaining % record_size != 0:
+        detected_offset, detected_confidence = _detect_imu_data_start(payload, record_size=record_size)
+        if detected_offset != header_offset:
+            raise ValueError(
+                "IMU layout mismatch: expected data offset "
+                f"{header_offset} after magic, heuristic detected {detected_offset}."
+            )
+        header_offset = detected_offset
+        offset_confidence = detected_confidence
     payload = payload[header_offset:]
     n_records = len(payload) // record_size
     if n_records == 0:
@@ -151,22 +171,39 @@ def parse_vts(path: str | Path) -> pd.DataFrame:
 
         payload = f.read()
 
-    header_offset, offset_confidence = _detect_vts_data_start(payload, record_size=24)
+    header_offset = VTS_DATA_OFFSET_AFTER_MAGIC
+    offset_confidence = 1.0
+    remaining = len(payload) - header_offset
+    if remaining <= 0 or remaining % VTS_RECORD_SIZE_BYTES != 0:
+        detected_offset, detected_confidence = _detect_vts_data_start(
+            payload, record_size=VTS_RECORD_SIZE_BYTES
+        )
+        if detected_offset != header_offset:
+            raise ValueError(
+                "VTS layout mismatch: expected data offset "
+                f"{header_offset} after magic, heuristic detected {detected_offset}."
+            )
+        header_offset = detected_offset
+        offset_confidence = detected_confidence
     payload = payload[header_offset:]
     records: list[tuple[int, int]] = []
-    for offset in range(0, len(payload), 24):
-        chunk = payload[offset : offset + 24]
-        if len(chunk) != 24:
+    skipped_hi_nonzero = 0
+    skipped_stream_zero = 0
+    for offset in range(0, len(payload), VTS_RECORD_SIZE_BYTES):
+        chunk = payload[offset : offset + VTS_RECORD_SIZE_BYTES]
+        if len(chunk) != VTS_RECORD_SIZE_BYTES:
             break
         seq_idx, imu_like_ts, stream_id, frame_idx, frame_ts, frame_ts_hi = struct.unpack(
             "<6I", chunk
         )
         if frame_ts_hi != 0:
+            skipped_hi_nonzero += 1
             continue
         if stream_id == 0:
+            skipped_stream_zero += 1
             continue
-        # IMU timestamps are in nanoseconds-scale while this field is microseconds-scale.
-        timestamp_seconds = (int(frame_ts) * 1000) / 1_000_000_000.0
+        # frame_ts is in microseconds; convert to seconds in floating-point domain.
+        timestamp_seconds = int(frame_ts) / 1_000_000.0
         records.append((frame_idx, timestamp_seconds))
 
     if not records:
@@ -176,9 +213,19 @@ def parse_vts(path: str | Path) -> pd.DataFrame:
     vts.attrs["parser_diagnostics"] = {
         "data_offset_after_magic": float(header_offset),
         "offset_confidence": float(offset_confidence),
-        "record_size_bytes": 24.0,
-        "timestamp_source": "frame_ts_us_to_ns_to_s_from_6I_layout",
+        "record_size_bytes": float(VTS_RECORD_SIZE_BYTES),
+        "timestamp_source": "frame_ts_us_to_s_from_6I_layout",
+        "skipped_frame_ts_hi_nonzero": float(skipped_hi_nonzero),
+        "skipped_stream_id_zero": float(skipped_stream_zero),
     }
+    total_skipped = skipped_hi_nonzero + skipped_stream_zero
+    if total_skipped > 0:
+        LOGGER.info(
+            "VTS parser skipped %d records (frame_ts_hi!=0: %d, stream_id==0: %d).",
+            total_skipped,
+            skipped_hi_nonzero,
+            skipped_stream_zero,
+        )
     if not np.all(np.diff(vts["timestamp"].to_numpy()) >= 0):
         raise ValueError("VTS timestamps are not monotonic non-decreasing.")
     return vts

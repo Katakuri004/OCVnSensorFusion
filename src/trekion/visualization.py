@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import cv2
+import matplotlib.pyplot as plt
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 from matplotlib.figure import Figure
 import numpy as np
@@ -41,6 +42,7 @@ def render_imu_panel(window: pd.DataFrame, width: int, height: int, center_ts: f
     canvas.draw()
     buf = np.asarray(canvas.buffer_rgba(), dtype=np.uint8)
     panel = cv2.cvtColor(buf, cv2.COLOR_RGBA2BGR)
+    plt.close(fig)
     return panel
 
 
@@ -55,7 +57,10 @@ def draw_hud(
 ) -> np.ndarray:
     out = frame.copy()
     overlay = out.copy()
-    cv2.rectangle(overlay, (8, 8), (1080, 182), (0, 0, 0), -1)
+    h, w = out.shape[:2]
+    hud_right = min(w - 8, int(0.56 * w))
+    hud_bottom = min(h - 8, int(0.17 * h))
+    cv2.rectangle(overlay, (8, 8), (hud_right, hud_bottom), (0, 0, 0), -1)
     out = cv2.addWeighted(overlay, 0.45, out, 0.55, 0.0)
 
     lines = [

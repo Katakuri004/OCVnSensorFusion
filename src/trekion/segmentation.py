@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 from pathlib import Path
 from time import perf_counter
 from typing import Any
+import urllib.error
 import urllib.request
 
 import cv2
@@ -116,6 +118,24 @@ class Phase3Config:
     apply_scene_priors_posttrack: bool = False
     hand_model_cache_dir: Path = Path("models")
 
+    def __post_init__(self) -> None:
+        if not (0.0 <= self.conf <= 1.0):
+            raise ValueError(f"conf must be in [0, 1], got {self.conf}.")
+        if self.imgsz <= 0:
+            raise ValueError(f"imgsz must be > 0, got {self.imgsz}.")
+        if not (0.0 <= self.smoothing_alpha <= 1.0):
+            raise ValueError(
+                f"smoothing_alpha must be in [0, 1], got {self.smoothing_alpha}."
+            )
+        if self.min_confirm_frames < 1:
+            raise ValueError(
+                f"min_confirm_frames must be >= 1, got {self.min_confirm_frames}."
+            )
+        if self.track_ttl_frames < 0:
+            raise ValueError(
+                f"track_ttl_frames must be >= 0, got {self.track_ttl_frames}."
+            )
+
 
 @dataclass
 class SceneDetection:
@@ -196,7 +216,13 @@ def ensure_hand_landmarker_model(cache_dir: Path) -> Path:
     cache_dir.mkdir(parents=True, exist_ok=True)
     path = cache_dir / "hand_landmarker.task"
     if not path.exists():
-        urllib.request.urlretrieve(HAND_MODEL_URL, path)
+        try:
+            urllib.request.urlretrieve(HAND_MODEL_URL, path)
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise RuntimeError(
+                "Failed to download MediaPipe hand model. "
+                f"Download it manually from {HAND_MODEL_URL} and place it at {path}."
+            ) from exc
     return path
 
 
@@ -295,7 +321,7 @@ def infer_detections(
             continue
         stage_counts["after_min_area"] += 1
         if pipeline.config.apply_scene_priors_pretrack and not _passes_scene_priors(
-            class_name=raw_name,
+            class_name=class_name,
             bbox_xyxy=(x1, y1, x2, y2),
             frame_w=w,
             frame_h=h,
@@ -379,7 +405,7 @@ def fuse_scene_and_hands(
             d
             for d in tracked
             if _passes_scene_priors(
-                class_name=d.raw_class_name,
+                class_name=d.class_name,
                 bbox_xyxy=d.bbox_xyxy,
                 frame_w=frame_bgr.shape[1],
                 frame_h=frame_bgr.shape[0],
@@ -413,18 +439,23 @@ def fuse_scene_and_hands(
 
 def render_detections(frame_bgr: np.ndarray, fused: FusedFrame) -> np.ndarray:
     out = frame_bgr.copy()
+    mask_overlay = out.copy()
+    has_mask = False
     for det in fused.detections:
         x1, y1, x2, y2 = [int(v) for v in det.bbox_xyxy]
         color = _color_for_label(det.class_name)
         if det.mask is not None:
-            overlay = out.copy()
-            overlay[det.mask > 0] = (0.65 * np.array(color) + 0.35 * overlay[det.mask > 0]).astype(np.uint8)
-            out = cv2.addWeighted(overlay, 0.35, out, 0.65, 0.0)
+            has_mask = True
+            mask_overlay[det.mask > 0] = (
+                0.65 * np.array(color) + 0.35 * mask_overlay[det.mask > 0]
+            ).astype(np.uint8)
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
         label = f"{det.class_name} {det.confidence:.2f}"
         if det.track_id is not None:
             label = f"#{det.track_id} {label}"
         cv2.putText(out, label, (x1, max(18, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+    if has_mask:
+        out = cv2.addWeighted(mask_overlay, 0.35, out, 0.65, 0.0)
 
     for hand in fused.hands:
         points = [(int(x * out.shape[1]), int(y * out.shape[0])) for x, y in hand.landmarks_norm]
@@ -463,8 +494,30 @@ def render_detections(frame_bgr: np.ndarray, fused: FusedFrame) -> np.ndarray:
 
 
 def draw_hands_bgr(frame_bgr: np.ndarray, landmarker: mp.tasks.vision.HandLandmarker, timestamp_ms: int) -> np.ndarray:
-    tmp = Phase3Pipeline(config=Phase3Config(enable_hands=True), detector=None, class_names={}, hand_landmarker=landmarker)
-    hands = infer_hands(tmp, frame_bgr, timestamp_ms)
+    h, w = frame_bgr.shape[:2]
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    result = landmarker.detect_for_video(mp_image, timestamp_ms)
+    hands: list[HandDetection] = []
+    for idx, hand in enumerate(result.hand_landmarks):
+        xs = [lm.x for lm in hand]
+        ys = [lm.y for lm in hand]
+        score = 0.0
+        if idx < len(result.handedness) and len(result.handedness[idx]) > 0:
+            score = float(result.handedness[idx][0].score)
+        hands.append(
+            HandDetection(
+                landmarks_norm=[(float(lm.x), float(lm.y)) for lm in hand],
+                bbox_xyxy=(
+                    max(0.0, min(xs)) * w,
+                    max(0.0, min(ys)) * h,
+                    min(1.0, max(xs)) * w,
+                    min(1.0, max(ys)) * h,
+                ),
+                confidence=score,
+                stable=score >= 0.5,
+            )
+        )
     fused = FusedFrame(
         detections=[],
         hands=hands,
@@ -666,7 +719,7 @@ def _is_high_motion(imu_row: dict[str, float] | None, threshold: float) -> bool:
 
 
 def _color_for_label(label: str) -> tuple[int, int, int]:
-    seed = abs(hash(label)) % 255
+    seed = hashlib.md5(label.encode("utf-8")).digest()[0]
     return (50 + (seed * 29) % 205, 50 + (seed * 53) % 205, 50 + (seed * 97) % 205)
 
 
