@@ -4,3 +4,6 @@ __pycache__/
 outputs/*.mp4
 models/*.task
 yolov8*.pt
+data/recording*.mp4
+data/recording*.imu
+data/recording*.vts
