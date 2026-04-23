@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+*.pyc
+outputs/*.mp4
+models/*.task
+yolov8*.pt

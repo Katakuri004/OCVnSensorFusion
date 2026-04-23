@@ -1,0 +1,11 @@
+numpy
+opencv-python
+matplotlib
+pandas
+pytest
+torch
+transformers
+accelerate
+Pillow
+ultralytics
+mediapipe
